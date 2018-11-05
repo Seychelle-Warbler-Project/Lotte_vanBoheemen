@@ -1,0 +1,1435 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Load-lightening data < Total feeds> in mcmcglmm
+===
+
+---
+author: "Hannah Dugdale & Lotte van Boheemen""
+
+output: html_document
+   pandoc_args: ["+RTS", "-K1024m", "-RTS"]
+---
+
+**Load lightening in Seychelles warblers**
+
+
+**load libraries**
+---
+```{r, include=FALSE}
+rm(list=ls())
+library(knitr)
+library(MCMCglmm)
+library(reshape)
+library(plyr)
+library(lme4)
+library(usdm)
+library(ggplot2)
+#opts_knit$set(root.dir = '/Users/lottevanboheemen/Documents/Other/Seych/Data', warning=FALSE, message=T)
+```
+
+Package versions:
+```{r}
+sessionInfo()
+```
+
+**Read and correct data**
+---
+
+Read in data, which comes from access query "qryHD_LoadLight_sqd_BrMBrF_ForR". The data from the Access query are then modified in Excel, such that:
+1) 2 watches with heavy rain / unrelaible comments are removed (nestwatchID = 1192)
+2) 1 watch where mate is unknown was removed (nestwatchID = 839). WatchID=1172 has birdID=-1, but this can be tracked to birdID=1605.
+3) 36 watches where mate has no feeds, but the mate was observed in the territory before and after the nest watch, have a row entered manually for the mate with feed=0, but only if there were NO unidentified birds feeding during the nest watch (e.g. NestWatchID=138 BrM did not have zero feeds entered as BrM not observed after; NestWatchID=641,651,1323 did not have Br=0 feeds entered as there were feeds by unidentified bird; NestWatchID=1151 & 1292 had an UR helper, but feeds entered as 0 as BrMs were ringed and present before/after plus no feeds by unringed bird).
+These edits are saved in worksheet="Edits" in the Excel file "/Users/hannahdugdale/MediaFire/Seychelles_warbler/Load lightening analysis/20150622/qryHD_LoadLight_sqd_BrMBrF_ForR_20150805.xlsx"
+```{r}
+data<-read.table("qryHD_LoadLight_sqd_BrMBrF_ForR_20151127_NoMorF_H_GroupSize_WithSummer2015.txt",header=T) 
+data$BirdID<-as.factor(data$BirdID) 
+data$Status<-as.factor(data$Status)
+data$WatchDate <- as.Date(data$WatchDate, "%d/%m/%y")
+data$MateID<-as.factor(data$Mate) #Code had MateID but query labelled column Mate
+data$TID<-as.factor(data$TerritoryID) 
+data$BGID<-as.factor(data$BreedGroupID)
+data$NID<-as.factor(data$NestID) #NestID was in twice, make sure just once
+data$NWID<-as.factor(data$NestWatchID)
+data$Obs<-as.factor(data$Observer)
+data$Helper01<-as.factor(data$Helper01)
+data$Month<-as.factor(data$Month)
+data$Year<-as.factor(data$Year2)
+str(data)
+data$FeedsHour <- data$NoFeeds/(data$ObsDuration/60)
+data$LogFeedsPerHour <- log(data$FeedsHour)
+data$sqrtFeedsPerHour <- sqrt(data$FeedsPerHour)
+head(data)
+str(data)
+```
+
+Correct the data:
+```{r}
+#Correct Brood size so FLW is number of FL
+data$NoOffspring <- data$BroodSize #Create new FPID column filled with non-unique FPID
+for (i in 1:(nrow(data)))
+{ 
+  if(data[i,'WatchType'] == 'FL') 
+  {
+    data[i,'NoOffspring'] <- data[i,'NoFledglings']
+  } 
+}
+
+#CHeck for FL=0 in FL watch
+test<-data[data$WatchType == 'FL',] 
+FL_0<-test[test$NoFledglings==0,] 
+#Change the FL=0 in NestWatchID=1152 to 1
+for (i in 1:(nrow(data)))
+{ 
+  if(data[i,'NestWatchID']== 1152) 
+  {
+    data[i,'NoOffspring'] <- data[i,'BroodSize']
+  } 
+}
+```
+
+Create sub-set with only less than 10 percent birds provisioning unknown or unringed (NB: this is very conservative as usually the breeder is ringed so we could have restricted only to watches where there are unidentified birds):
+```{r}
+data_UnID<-data
+data_UnID<-subset(data_UnID, X.UkUR <= 10)
+hist(data_UnID$NoFeeds)
+hist(data_UnID$FeedsPerHour)
+hist(data_UnID$LogFeedsPerHour)
+hist(data_UnID$sqrtFeedsPerHour)
+data_UnID_res <- subset(data_UnID,!is.na(data_UnID[,36]))
+```
+
+**General data checks**
+---
+
+> There is a clear truncation at 0 (more zero's then expected). Mcmcglmm should be able to deal with this, although we need to check if it did a good job
+
+
+Calculate the number of watches used, their total duration, and how many watches were excluded:
+```{r}
+data_NWID <- unique(data$NestWatchID) #N=701 watches (including wtaches with >10% events by unidentified provisioning birds)
+data_NWID <- as.data.frame(unique(cbind(data$NestWatchID, data$ObsDuration, data$X.UkUR))) #N=701
+colnames(data_NWID) <- c("NestWatchID", "ObsDuration", "X.UkUR")
+data_NWID<-subset(data_NWID, X.UkUR <= 10) #N=523 watches included in analyses
+sum(data_NWID$ObsDuration)/60 # analysed watches covered 567.45 hours
+
+data_UnID_exclude<-subset(data, X.UkUR > 10)
+data_UnID_exclude_NWID <- unique(data_UnID_exclude$NestWatchID)  #N=178 watches excluded
+```
+
+
+Check outlier CH values:
+```{r}
+BroodSize <- cast(data_UnID, BroodSize ~ NestID)
+str(BroodSize$BroodSize)
+CH_3<-data_UnID[data_UnID$BroodSize==3,]
+str(CH_3$NestWatchID)
+```
+> 2 nest watches (n=4 records) have 3 chicks
+
+Check how many nests have >1 watch (need to create a chick age code):
+```{r}
+FWperNest_sqa <- subset(data_UnID, select=c("NestID", "NestWatchID"))  #Create data frame of just breed group and nest watch ID
+FWperNest_sqa <- unique(FWperNest_sqa) #Create unique values
+FWperNest_sqb <- as.data.frame(table(FWperNest_sqa$NestID))
+colnames(FWperNest_sqb) <- c("NestID", "NW_count")
+FWperNest <- as.data.frame(table(FWperNest_sqb$NW_count))
+FWperNest
+```
+> Most nests have 1 watch, maximum is 3 watches at a nest
+
+Check how many nests have >1 watch of the same watch type:
+```{r}
+NW_sqa <- subset(data_UnID, select=c("NestID", "NestWatchID", "WatchType"))
+NW_sqa <- unique(NW_sqa) #Create unique values
+NW_sqa <- subset(NW_sqa, select=c("NestID", "WatchType")) 
+counts <- ddply(NW_sqa, .(NW_sqa$NestID, NW_sqa$WatchType), nrow)
+names(counts) <- c("NestID", "WatchTYpe", "Freq")
+TypePerNest <- as.data.frame(table(counts$Freq))
+TypePerNest 
+```
+> 47 nests have >1 watch of same watchType
+
+Check how many nests have >1 nestling feed watch:
+```{r}
+FW <- subset(data_UnID, select=c("NestID", "NestWatchID", "WatchType"))  #Create data frame
+FW <- FW[FW$WatchType == 'F',] #Restcit to FW only
+FW <- unique(FW) #Create unique values
+FW_NestID <- unique(FW$NestID)  #218 nests have watches
+FWcounts <- ddply(FW, .(FW$NestID), nrow)
+names(FWcounts) <- c("NestID", "FW_Count")
+FWcounts <- FWcounts[FWcounts$FW_Count > 1 ,] 
+str(FWcounts$NestID)
+14/218  
+```
+> 6% of nests have 2 nestling feed watches (none have >2)
+
+Get a rough idea of disrtibution of the DATA with shapiro test:
+```{r}
+shapiro.test(data_UnID$FeedsHour) 
+shapiro.test(data_UnID$LogFeedsPerHour) 
+shapiro.test(data_UnID$sqrtFeedsPerHour) 
+```
+> p-lower than 0.05 means it deviates from normality
+> sqrt transformation helps, but better to round up and treat as counts within a 60 min watch or use an offset
+
+Get a rough idea of disrtibution of the DATA with ks test:
+```{r}
+y <- rnorm(100)
+ks.test(data$FeedsHour, y) 
+ks.test(data$LogFeedsPerHour, y) 
+ks.test(data$sqrtFeedsPerHour, y)
+```
+> Results are the same
+
+
+**Check for collinearity**
+---
+```{r}
+Z<-na.omit(cbind(data_UnID$Year,data_UnID$ObsDuration, data_UnID$Month, data_UnID$NoOffspring, data_UnID$Status, data_UnID$WatchType, data_UnID$BirdID, data_UnID$NestID, data_UnID$NestWatchID, data_UnID$AnnualInsects, data_UnID$Obs, data_UnID$TQc_Combined, data_UnID$GroupSize, data_UnID$NoH))
+colnames(Z)<-c("Year","ObsDuration","Month","NoOffspring","Status","WatchType","BirdID","NestID","NestWatchID","AnnualInsects","Obs","TQcCombined","GroupSize","NoH")
+
+pairs(Z)
+Z<-as.data.frame(Z) # turn into dataframe as vif function is not able to deal with previous format
+vif(Z)
+```
+
+> Year contributes heavily to collinearity, so removed.
+
+```{r}
+Z2<-na.omit(cbind(data_UnID$ObsDuration, data_UnID$Month, data_UnID$NoOffspring, data_UnID$Status, data_UnID$WatchType, data_UnID$BirdID, data_UnID$NestID, data_UnID$NestWatchID, data_UnID$AnnualInsects, data_UnID$Obs, data_UnID$TQc_Combined, data_UnID$GroupSize, data_UnID$NoH))
+colnames(Z2)<-c("ObsDuration","Month","NoOffspring","Status","WatchType","BirdID","NestID","NestWatchID","AnnualInsects","Obs","TQcCombined","GroupSize","NoH")
+
+pairs(Z2)
+Z2<-as.data.frame(Z2)
+vif(Z2)
+```
+
+> NestID, BirdID and NestWatchID are random effects & NestWatchID is nested in NestID
+
+
+**THIS MODEL WAS USED (complete data, NoOffsrping>=1)**
+---
+
+MCMCglmm, restricting data to years & months with insect counts.
+In this model I use **Monthly insects** (mean of raw monthly insect counts in the month that the watch was conducted; based on “usys_qTerrQualityAvgInsectsByYearAndLocation” - I removed species and location from the query, changed it to a select query, added in Month (i.e. Month([SamplingDate])) and summed the TotalInvertCount) and **TQ** (checked that TQ is the same for TerrID in different season) - it was standardised each season [based on sys_TerritoryQuality] and the mean taken over 1995-2015 (FPID>17); a modified version of Hammers et al 2012 PlosONE, where TQ is mean centered and divided by 2 StDev as recommended by Gelman & Hill 2007 [Hammers et al 2012 used 1 StDev] BUT **missing values are omitted**:
+
+```{r, cache=T}
+library(MCMCglmm)
+write.csv(data_UnID_res, "Data_used_loadlightening_model.csv")
+
+prior2exp_sex_rcov = list(B = list(V=diag(13)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0,0,0,0)), #Watchtype has 3 levels, so 3 interactions with Status
+                     R = list(V = diag(2)*1, n =0.002), 
+                     G = list(G1 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G3 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior2exp_sex_rcov$B$V[2,2] <- 1e-7  ## replace ObsDuration (offset) variance
+
+mod2_UnID_exp_thin400_rcov <- MCMCglmm(NoFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + NoOffspring + GroupSize + NoH*Status + Status*WatchType, random=~ idh(Status):BirdID + NestID:NestWatchID + Obs, rcov= ~idh(Status):units, family="poisson", data=data_UnID_res, prior=prior2exp_sex_rcov, burnin=500000, thin=400, nitt=4500000, verbose=TRUE)
+load("mod2_UnID_exp_thin400_rcov_20171127.Rdata")
+
+autocorr(mod2_UnID_exp_thin400_rcov$Sol) # for each parameter against self, Lag 200 < 0.1
+autocorr(mod2_UnID_exp_thin400_rcov$VCV) # for each parameter against self, Lag 200 < 0.1
+heidel.diag(mod2_UnID_exp_thin400_rcov$VCV) # ok
+geweke.diag(mod2_UnID_exp_thin400_rcov$VCV) # z-scores should be <2; ok
+geweke.plot(mod2_UnID_exp_thin400_rcov$VCV) # ok
+plot(mod2_UnID_exp_thin400_rcov$VCV) # ok
+
+summary(mod2_UnID_exp_thin400_rcov)
+posterior.mode(mod2_UnID_exp_thin400_rcov$Sol)
+HPDinterval(mod2_UnID_exp_thin400_rcov$Sol)
+posterior.mode(mod2_UnID_exp_thin400_rcov$VCV)
+HPDinterval(mod2_UnID_exp_thin400_rcov$VCV)
+```
+
+**THIS MODEL WAS USED (subset NoOffspring==1)**
+---
+```{r, cache=T}
+library(MCMCglmm)
+data_UnID_res <- subset(data_UnID,!is.na(data_UnID[,36]))
+data_UnID_res_sub <- subset(data_UnID_res,NoOffspring==1)
+
+write.csv(data_UnID_res_sub, "Data_used_sub_loadlightening_model.csv")
+
+prior2exp_sub_sex_rcov = list(B = list(V=diag(12)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0,0,0)), #Watchtype has 3 levels, so 3 interactions with Status
+                     R = list(V = diag(2)*1, n =0.002), 
+                     G = list(G1 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G3 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior2exp_sub_sex_rcov$B$V[2,2] <- 1e-7  ## replace ObsDuration (offset) variance
+
+mod2_UnID_sub_exp_thin400_rcov <- MCMCglmm(NoFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + GroupSize + NoH*Status + Status*WatchType, random=~ idh(Status):BirdID + NestID:NestWatchID + Obs, rcov= ~idh(Status):units, family="poisson", data=data_UnID_res_sub, prior=prior2exp_sub_sex_rcov, burnin=500000, thin=400, nitt=4500000, verbose=TRUE)
+
+save(mod2_UnID_sub_exp_thin400_rcov, file="mod2_UnID_sub_exp_thin400_rcov_20180427.Rdata")
+load("mod2_UnID_sub_exp_thin400_rcov_20180427.Rdata")
+
+autocorr(mod2_UnID_sub_exp_thin400_rcov$Sol) # for each parameter against self, Lag 400 < 0.1 - ok
+autocorr(mod2_UnID_sub_exp_thin400_rcov$VCV) # for each parameter against self, Lag 400 < 0.1 - ok
+heidel.diag(mod2_UnID_sub_exp_thin400_rcov$VCV) # ok for thin=400
+geweke.diag(mod2_UnID_sub_exp_thin400_rcov$VCV) # z-scores should be <2; ok
+geweke.plot(mod2_UnID_sub_exp_thin400_rcov$VCV) # ok
+plot(mod2_UnID_sub_exp_thin400_rcov$VCV) # ok
+```
+
+Calculate repeatability of provisioning behaviour (from model used above, rcov split by sex):
+```{r, cache=T}
+posterior.mode(mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrF.BirdID"])
+posterior.mode(mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrM.BirdID"])
+
+# Coding spliting by sex is wrong, as only BirdID is estimated separately by sex, the other variance components would also need splitting, at least the residual
+#repeatBrF <- mod2_UnID_exp_thin200$VCV[, "StatusBrF.BirdID"]/(mod2_UnID_exp_thin200$VCV[, "StatusBrF.BirdID"] + 
+#                                   mod2_UnID_exp_thin200$VCV[, "StatusBrM.BirdID"] +
+#                                   mod2_UnID_exp_thin200$VCV[, "NestID:NestWatchID"]+
+#                                   mod2_UnID_exp_thin200$VCV[, "Obs"]+
+#                                   mod2_UnID_exp_thin200$VCV[, "units"]+
+#                                   log(1/exp(mod2_UnID_exp_thin200$Sol[,"(Intercept)"])+1))
+
+#posterior.mode(repeatBrF)
+#HPDinterval(repeatBrF)
+
+#repeatBrM <- mod2_UnID_exp_thin200$VCV[, "StatusBrM.BirdID"]/(mod2_UnID_exp_thin200$VCV[, "StatusBrF.BirdID"] + 
+#                                   mod2_UnID_exp_thin200$VCV[, "StatusBrM.BirdID"] +
+#                                   mod2_UnID_exp_thin200$VCV[, "NestID:NestWatchID"]+
+#                                   mod2_UnID_exp_thin200$VCV[, "Obs"]+
+#                                   mod2_UnID_exp_thin200$VCV[, "units"]+
+#                                   log(1/exp(mod2_UnID_exp_thin200$Sol[,"(Intercept)"])+1))
+
+#posterior.mode(repeatBrM)
+#HPDinterval(repeatBrM)
+
+repeatAll <- (mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrF.BirdID"] + mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrM.BirdID"]) /(mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrF.BirdID"] + 
+                                   mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrM.BirdID"] +
+                                   mod2_UnID_exp_thin400_rcov$VCV[, "NestID:NestWatchID"]+
+                                   mod2_UnID_exp_thin400_rcov$VCV[, "Obs"]+
+                                   mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrF.units"]+
+                                   mod2_UnID_exp_thin400_rcov$VCV[, "StatusBrF.units"]+
+                                   log(1/exp(mod2_UnID_exp_thin400_rcov$Sol[,"(Intercept)"])+1))
+
+posterior.mode(repeatAll)
+HPDinterval(repeatAll)
+```
+
+
+Calculate repeatability of provisioning behaviour from a new model, splitting all variances by sex (takes hours to run, haven't used this in the manuscript):
+```{r, cache=T}
+prior2bexp_sex = list(B = list(V=diag(13)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0,0,0,0)), #Watchtype has 3 levels, so 3 interactions with Status
+                  R = list(V = diag(2)*1, n =0.002), 
+                  G = list(G1 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), 
+                           G2 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), 
+                           G3 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000)))
+prior2bexp_sex$B$V[2,2] <- 1e-7  ## replace ObsDuration (offset) variance
+prior2bexp_sex
+
+#mod2b_UnID_exp_thin2000 <- MCMCglmm(NoFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + NoOffspring + GroupSize + NoH*Status + Status*WatchType, random=~ idh(Status):BirdID + idh(Status):NestID:NestWatchID + idh(Status):Obs, rcov= ~idh(Status):units, family="poisson", data=data_UnID_res, prior=prior2bexp_sex, burnin=1000000, thin=2000, nitt=21000000, verbose=TRUE)
+#burnin=500000, thin=200, nitt=2500000
+#save(mod2b_UnID_exp_thin2000, file="mod2b_UnID_exp_thin2000_20151130.Rdata")
+load("mod2b_UnID_exp_thin2000_20151130.Rdata")
+autocorr(mod2b_UnID_exp_thin2000$Sol) # for each parameter against self, Lag 200 < 0.1 - ok
+autocorr(mod2b_UnID_exp_thin2000$VCV) # for each parameter against self, Lag 200 < 0.1 - ok
+heidel.diag(mod2b_UnID_exp_thin2000$VCV) # ok
+geweke.diag(mod2b_UnID_exp_thin2000$VCV) # z-scores should be <2 - ok
+geweke.plot(mod2b_UnID_exp_thin2000$VCV) # 
+plot(mod2b_UnID_exp_thin2000$VCV) # some plots have no peak (units; BrM.BirdID) and NestID:NestWatchID is bimodal
+
+summary(mod2b_UnID_exp_thin2000) # results are the same
+posterior.mode(mod2b_UnID_exp_thin2000$Sol)
+HPDinterval(mod2b_UnID_exp_thin2000$Sol)
+posterior.mode(mod2b_UnID_exp_thin2000$VCV)
+HPDinterval(mod2b_UnID_exp_thin2000$VCV)
+
+repeatAllb <- (mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.BirdID"] + mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.BirdID"]) / (mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.BirdID"] + 
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.BirdID"] +
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.NestID:NestWatchID"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.NestID:NestWatchID"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.Obs"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.Obs"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.units"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.units"]+
+                                   log(1/exp(mod2b_UnID_exp_thin2000$Sol[,"(Intercept)"])+1))
+posterior.mode(repeatAllb)
+HPDinterval(repeatAllb)
+# 0.03367465 [0.01495871, 0.05721067]
+
+repeatAllbF <- mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.BirdID"] / (mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.BirdID"] + 
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.NestID:NestWatchID"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.Obs"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrF.units"]+
+                                   log(1/exp(mod2b_UnID_exp_thin2000$Sol[,"(Intercept)"])+1))
+posterior.mode(repeatAllbF)
+HPDinterval(repeatAllbF)
+# 0.0306106 [0.01270872 0.05271384]
+
+repeatAllbM <- mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.BirdID"] / (mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.BirdID"] + 
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.NestID:NestWatchID"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.Obs"]+
+                                   mod2b_UnID_exp_thin2000$VCV[, "StatusBrM.units"]+
+                                   log(1/exp(mod2b_UnID_exp_thin2000$Sol[,"(Intercept)"])+1))
+posterior.mode(repeatAllbM)
+HPDinterval(repeatAllbM)
+# 0.0001282561  [7.55297e-09 0.01916178]
+
+```
+
+
+**Plots used in MS, full dataset (NoOffspring >=1)**
+---
+
+** PLOT Figure 1 in manuscript of the posterior estimates of fixed effects from the first model that we used (mod2_UnID_exp_thin200; not the 2nd repeatability model with thin=2000 and variances split by sex)**
+
+```{r, cache=T}
+####Figure 1
+load(file="mod2_UnID_exp_thin400_rcov_20171127.Rdata")
+Fig1 <- as.data.frame(posterior.mode(mod2_UnID_exp_thin400_rcov$Sol))
+Fig1b <- HPDinterval(mod2_UnID_exp_thin400_rcov$Sol)
+Fig1 <- cbind(Fig1, Fig1b)
+colnames(Fig1) <- c("PosteriorMode", "Lower", "Upper")
+
+rownames(Fig1) = c("Intercept","log(ObsDuration)", "Monthly insect abundance*","Territory quality*", "No. offspring*","Group size*" ,"No. helpers" ,"Dominant male", "Provisioning and brooding","Provisioning fledgling","Dominant male x No. helpers*", "Dominant male x Provisioning and brooding","Dominant male x Provisioning fledgling")
+
+Fig1$Parameter <- factor(rownames(Fig1))
+Fig1 = Fig1[-2,]
+
+pdf("Figure1_NoFeeds_modelsum.pdf", width = 7, height = 5)
+ggplot(Fig1,aes(x=Parameter,y=PosteriorMode))+ 
+  geom_point()+
+  theme_bw() +
+  theme(panel.border = element_blank())+
+  theme(axis.line = element_line(color = 'black'))+
+  geom_errorbar(aes(ymin=Lower,
+                    ymax=Upper), width=0.2)+
+  theme(axis.text=element_text(size=11))+
+  xlab("")+
+  geom_hline(yintercept=0, size=0.15, linetype="dashed")+
+  ylab("Parameter estimates")+coord_flip()+  scale_x_discrete(limits=rev(Fig1$Parameter))
+dev.off()
+```
+
+
+** Calculate predicted values from MCMCglmm and also predicted values using a new dataset in glmer to plot with**:
+
+```{r, cache=T}
+# Generate predicted values with MCMCglmm model
+load("mod2_UnID_exp_thin400_rcov_20171127.Rdata")
+
+Predictions2b <- predict(mod2_UnID_exp_thin400_rcov, interval="confidence")
+pred.2b <- as.data.frame(cbind(data_UnID_res,Predictions2b))
+```
+
+
+**Plot Figure 2 - the number of feeds against the number of helpers, first using the glmer model and observed data, which don't fit well and didn't use, and secondly using the predicted values from MCMCglmm**:
+
+```{r, cache=T}
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # 
+#  
+#  Plot: PREDICTED No. of helpers against No. of feeds - USED in Figure 2
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+
+Aver2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), mean)
+SE2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), st.err)
+CI2b_pred <- as.data.frame(SE2b_pred$x*1.96)
+NoBirds2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), length)
+NoH_Mean2b_pred <- cbind(Aver2b_pred, SE2b_pred[,2], NoBirds2b_pred[,2], CI2b_pred[,1])
+colnames(NoH_Mean2b_pred) <- c("NoH", "Mean_No_Feeds", "SE", "N", "CI")
+
+pdf("Figure2_Predicted_NoFeeds_NoH_plot_20180516.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean2b_pred, aes(NoH, Mean_No_Feeds)) + 
+  xlab("Number of helpers") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean2b_pred, aes(NoH_Mean2b_pred$NoH, NoH_Mean2b_pred$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean2b_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean2b_pred,aes(label=NoH_Mean2b_pred$N, y=10.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+        scale_y_continuous(limits=c(6,10))
+
+dev.off()
+```
+
+**PLOT Figure 3 - Number of feeds by primary male and female according to watch type (also includes code for several plots that did not use)**
+```{r, cache=T}
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#  
+#  Plot: WatchType against PREDICTED No. of feeds, per Sex - USED for Figure 3
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+
+# code used column 57, but when re-laoding it, changes to column 54
+Aver3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), mean)
+SE3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), st.err)
+CI3_pred <- as.data.frame(SE3_pred$x*1.96)
+NoBirds3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), length)
+NoH_Mean3_pred <- cbind(Aver3_pred, SE3_pred[,3], NoBirds3_pred[,3], CI3_pred[,1])
+colnames(NoH_Mean3_pred) <- c("WatchType", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="FI"] <- "Brood. nestling"
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="FL"] <- "Fledgling"
+NoH_Mean3_pred$WatchType <- factor(NoH_Mean3_pred$WatchType, levels = c("Brood. nestling", "Nestling", "Fledgling"))
+
+levels(NoH_Mean3_pred$Status)[levels(NoH_Mean3_pred$Status)=="BrF"] <- "Dominant female"
+levels(NoH_Mean3_pred$Status)[levels(NoH_Mean3_pred$Status)=="BrM"] <- "Dominant male"
+
+pdf("Figure3_Predicted_NoFeeds_WatchType_Sex_plot_20180517.pdf", width = 8, height = 5)
+ggplot(data=NoH_Mean3_pred, aes(WatchType, Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  xlab("Provisioning watch type") + 
+  ylab("Predicted mean no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean3_pred, aes(NoH_Mean3_pred$WatchType, NoH_Mean3_pred$Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  geom_errorbar(data=NoH_Mean3_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status)  + #width=0.2
+geom_text(data=NoH_Mean3_pred,aes(label=NoH_Mean3_pred$N, y=13.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  scale_y_continuous(limits=c(5,13))
+dev.off()
+```
+
+
+**Plots for the subsetted data (NoOffspring ==1)**
+---
+** PLOT Figure 1 in manuscript of the posterior estimates of fixed effects from the first model that we used (mod2_UnID_sub_exp_thin400_rcov)**
+```{r, cache=T}
+####Figure 1
+load(file="mod2_UnID_sub_exp_thin400_rcov_20180427.Rdata")
+Fig1 <- as.data.frame(posterior.mode(mod2_UnID_sub_exp_thin400_rcov$Sol))
+Fig1b <- HPDinterval(mod2_UnID_sub_exp_thin400_rcov$Sol)
+Fig1 <- cbind(Fig1, Fig1b)
+colnames(Fig1) <- c("PosteriorMode", "Lower", "Upper")
+rownames(Fig1) = c("Intercept","log(ObsDuration)", "Monthly insect abundance*","Territory quality*", "No. offspring*","Group size*" ,"No. helpers" ,"Dominant male", "Provisioning and brooding","Provisioning fledgling","Dominant male x No. helpers*", "Dominant male x Provisioning and brooding","Dominant male x Provisioning fledgling")
+
+Fig1$Parameter <- factor(rownames(Fig1))
+Fig1 = Fig1[-2,]
+
+pdf("Figure1_sub_NoFeeds_modelsum.pdf", width = 7, height = 5)
+ggplot(Fig1,aes(x=Parameter,y=PosteriorMode))+ 
+  geom_point()+
+  theme_bw() +
+  theme(panel.border = element_blank())+
+  theme(axis.line = element_line(color = 'black'))+
+  geom_errorbar(aes(ymin=Lower,
+                    ymax=Upper), width=0.2)+
+  theme(axis.text=element_text(size=11))+
+  xlab("")+
+  geom_hline(yintercept=0, size=0.15, linetype="dashed")+
+  ylab("Parameter estimates")+coord_flip()+  scale_x_discrete(limits=rev(Fig1$Parameter))
+dev.off()
+```
+
+**Plot Figure 2 - the number of feeds against the number of helpers, first using the glmer model and observed data, which don't fit well and didn't use, and secondly using the predicted values from MCMCglmm**:
+```{r, cache=T}
+
+# Generate predicted values with MCMCglmm model
+load("mod2_UnID_sub_exp_thin400_rcov_20180427.Rdata")
+Predictions2b <- predict(mod2_UnID_sub_exp_thin400_rcov, interval="confidence")
+pred.2b <- as.data.frame(cbind(data_UnID_res_sub,Predictions2b))
+
+
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # 
+#  
+#  Plot: PREDICTED No. of helpers against No. of feeds - USED in Figure 2
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+     }
+
+Aver2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), mean)
+SE2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), st.err)
+CI2b_pred <- as.data.frame(SE2b_pred$x*1.96)
+NoBirds2b_pred <- aggregate(pred.2b$fit, list(NoH=pred.2b$NoH), length)
+NoH_Mean2b_pred <- cbind(Aver2b_pred, SE2b_pred[,2], NoBirds2b_pred[,2], CI2b_pred[,1])
+colnames(NoH_Mean2b_pred) <- c("NoH", "Mean_No_Feeds", "SE", "N", "CI")
+
+pdf("Figure2_sub_Predicted_NoFeeds_NoH_plot_20180517.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean2b_pred, aes(NoH, Mean_No_Feeds)) + 
+  xlab("Number of helpers") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean2b_pred, aes(NoH_Mean2b_pred$NoH, NoH_Mean2b_pred$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean2b_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean2b_pred,aes(label=NoH_Mean2b_pred$N, y=10.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+        scale_y_continuous(limits=c(6,10))
+
+dev.off()
+```
+
+**PLOT Figure 3 - Number of feeds by primary male and female according to watch type (also includes code for several plots that did not use)**
+```{r, cache=T}
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#  
+#  Plot: WatchType against PREDICTED No. of feeds, per Sex - USED for Figure 3
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+}
+
+Aver3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), mean)
+SE3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), st.err)
+CI3_pred <- as.data.frame(SE3_pred$x*1.96)
+NoBirds3_pred <- aggregate(pred.2b$fit, list(WatchType=pred.2b$WatchType, Status=pred.2b$Status), length)
+NoH_Mean3_pred <- cbind(Aver3_pred, SE3_pred[,3], NoBirds3_pred[,3], CI3_pred[,1])
+colnames(NoH_Mean3_pred) <- c("WatchType", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="FI"] <- "Brood. nestling"
+levels(NoH_Mean3_pred$WatchType)[levels(NoH_Mean3_pred$WatchType)=="FL"] <- "Fledgling"
+NoH_Mean3_pred$WatchType <- factor(NoH_Mean3_pred$WatchType, levels = c("Brood. nestling", "Nestling", "Fledgling"))
+
+levels(NoH_Mean3_pred$Status)[levels(NoH_Mean3_pred$Status)=="BrF"] <- "Dominant female"
+levels(NoH_Mean3_pred$Status)[levels(NoH_Mean3_pred$Status)=="BrM"] <- "Dominant male"
+
+pdf("Figure3_sub_Predicted_NoFeeds_WatchType_Sex_plot_20180517.pdf", width = 8, height = 5)
+ggplot(data=NoH_Mean3_pred, aes(WatchType, Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  xlab("Provisioning watch type") + 
+  ylab("Predicted mean no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean3_pred, aes(NoH_Mean3_pred$WatchType, NoH_Mean3_pred$Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  geom_errorbar(data=NoH_Mean3_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status)  + #width=0.2
+geom_text(data=NoH_Mean3_pred,aes(label=NoH_Mean3_pred$N, y=13.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+    scale_y_continuous(limits=c(5,13))
+
+dev.off()
+```
+
+
+
+
+-----------------------------------
+
+**Check vif post-modeling, from https://github.com/aufrank/R-hacks**
+---
+```{r}
+vif.MCMCglmm <- function (fit, intercept.columns = c(1)) {
+    nF <- fit$Fixed$nfl
+    v <- cov(as.matrix(fit$X[,1:nF]))
+    nam <- colnames(fit$Sol[,1:nF])
+    v <- v[-intercept.columns, -intercept.columns, drop = FALSE]
+    nam <- nam[-intercept.columns]
+    d <- diag(v)^0.5
+    v <- diag(solve(v/(d %o% d)))
+    names(v) <- nam
+    v
+}
+
+#variance inflation of fixed effects
+vif.MCMCglmm(mod2_UnID_exp_thin200)
+vif.MCMCglmm(mod2_UnID_sub_exp_thin300)
+```
+
+** USED SOME OF THIS SECTION FOR TOTAL FEEDS MODEL AND FIg.4**
+---
+
+Total feeds
+
+Subset dataframe for total feeds based on unique NestWatchID. This is easier than making a new file as it will incorporate any data changes or reformats in R.
+```{r}
+data_tot<-data_UnID_res[!duplicated(data_UnID_res$NestWatchID),]
+data_tot_sub<- data_UnID_res_sub[!duplicated(data_UnID_res_sub$NestWatchID),]
+```
+
+The effect of helper on total feeding recieved by the offspring 
+
+```{r}
+library(reshape)
+pred_Helper01 <- summarySE(data_UnID, measurevar="TotalFeedsPerHour", groupvars=c("Helper01"))
+```
+
+
+
+** Total feeds, USE THIS MODEL (full dataset, NoOffspring>=1)**
+---
+```{r,cache=TRUE}
+library(MCMCglmm)
+prior4_tot = list(B = list(V=diag(9)*1e7, mu=c(0,1,0,0,0,0,0,0,0)), # No. parameters & intercept & extra level; default is B$mu=0 and B$V=I*1e+10
+                  R = list(V = 1, n =0.002), 
+                  G = list(G1 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior4_tot$B$V[2,2] <- 1e-7 
+prior4_tot
+
+write.table(data_tot, "data_tot.txt")
+
+#model4_UnID_tot <- MCMCglmm(TotalFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + NoOffspring + GroupSize + NoH + WatchType , random=~NestID:NestWatchID + Obs, family="poisson", data=data_tot, prior=prior4_tot, verbose=TRUE, burnin=1000000, thin=2000, nitt=21000000) 
+#burnin=50000, thin=200, nitt=2500000
+#save(model4_UnID_tot, file="model4_UnID_tot_thin2000.Rdata")
+load("model4_UnID_tot_thin2000.Rdata")
+
+autocorr(model4_UnID_tot$Sol) # for each parameter against self, Lag 200 < 0.1
+autocorr(model4_UnID_tot$VCV) # for each parameter against self, Lag 200 > 0.16 for NestID:NestWatchID and units
+heidel.diag(model4_UnID_tot$VCV) # ok
+geweke.diag(model4_UnID_tot$VCV) # z-scores should be <2; ok
+geweke.plot(model4_UnID_tot$VCV) #
+plot(model4_UnID_tot$VCV) # still bimodal
+
+summary(model4_UnID_tot)
+posterior.mode(model4_UnID_tot$Sol)
+HPDinterval(model4_UnID_tot$Sol)
+posterior.mode(model4_UnID_tot$VCV)
+HPDinterval(model4_UnID_tot$VCV)
+```
+
+** Total feeds, USE THIS MODEL (sub dataset, NoOffspring==1)**
+---
+```{r,cache=TRUE}
+library(MCMCglmm)
+prior4_tot_sub = list(B = list(V=diag(8)*1e7, mu=c(0,1,0,0,0,0,0,0)), # No. parameters & intercept & extra level; default is B$mu=0 and B$V=I*1e+10
+                  R = list(V = 1, n =0.002), 
+                  G = list(G1 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior4_tot_sub$B$V[2,2] <- 1e-7 
+prior4_tot_sub
+
+write.table(data_tot_sub, "data_tot_sub.txt")
+data_tot_sub=read.table("data_tot_sub.txt", header = T)
+model4_UnID_tot_sub <- MCMCglmm(TotalFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + GroupSize + NoH + WatchType , random=~NestID:NestWatchID + Obs, family="poisson", data=data_tot_sub, prior=prior4_tot_sub, verbose=TRUE, burnin=1000000, thin=2000, nitt=21000000) 
+save(model4_UnID_tot_sub, file="model4_UnID_tot_sub_thin2000_180426.Rdata")
+load("model4_UnID_tot_sub_thin2000_180426.Rdata")
+
+autocorr(model4_UnID_tot_sub$Sol) # for each parameter against self, Lag 2000 < 0.1
+autocorr(model4_UnID_tot_sub$VCV) # for each parameter against self, Lag 2000 < 0.1
+heidel.diag(model4_UnID_tot_sub$VCV) # ok
+geweke.diag(model4_UnID_tot_sub$VCV) # z-scores should be <2; ok
+geweke.plot(model4_UnID_tot_sub$VCV) #
+plot(model4_UnID_tot_sub$VCV) # still bimodal
+
+summary(model4_UnID_tot_sub)
+posterior.mode(model4_UnID_tot_sub$Sol)
+HPDinterval(model4_UnID_tot_sub$Sol)
+posterior.mode(model4_UnID_tot_sub$VCV)
+HPDinterval(model4_UnID_tot_sub$VCV)
+```
+
+** PLOT Fig.4 - posterior estimates of fixed effects for total feeds (full dataset, NoOffspring>=1) **
+---
+
+```{r, cache=T}
+####Figure 4
+load(file="model4_UnID_tot_thin2000.Rdata")
+Fig4 <- as.data.frame(posterior.mode(model4_UnID_tot$Sol))
+Fig4b <- HPDinterval(model4_UnID_tot$Sol)
+Fig4 <- cbind(Fig4, Fig4b)
+colnames(Fig4) <- c("PosteriorMode", "Lower", "Upper")
+rownames(Fig4) = c("Intercept","log(ObsDuration)", "Monthly insect abundance*","Territory quality*", "No. offspring*","Group size*" ,"No. helpers" ,"Provisioning and brooding","Provisioning fledgling*")
+Fig4$Parameter <- rownames(Fig4)
+Fig4 = Fig4[-2,]
+
+pdf("Figure4_Total_feed_modelsum.pdf", width = 7, height = 5)
+ggplot(Fig4,aes(x=Parameter,y=PosteriorMode))+ 
+  geom_point()+
+  theme_bw() +
+  theme(panel.border = element_blank())+
+  theme(axis.line = element_line(color = 'black'))+
+  geom_errorbar(aes(ymin=Lower,
+                    ymax=Upper), width=0.2)+
+  theme(axis.text=element_text(size=11))+
+  xlab("")+
+  geom_hline(yintercept=0, size=0.15, linetype="dashed")+
+  ylab("Parameter estimates") +
+  coord_flip() + scale_x_discrete(limits=rev(Fig4$Parameter))
+dev.off()
+
+####Figure 5
+# Generate predicted values with MCMCglmm model
+Predictions4b <- predict(model4_UnID_tot, interval="confidence")
+pred.4b <- as.data.frame(cbind(data_tot,Predictions4b))
+
+Aver4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), mean)
+SE4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), st.err)
+CI4b_pred <- as.data.frame(SE4b_pred$x*1.96)
+NoBirds4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), length)
+NoH_Mean4b_pred <- cbind(Aver4b_pred, SE4b_pred[,2], NoBirds4b_pred[,2], CI4b_pred[,1])
+colnames(NoH_Mean4b_pred) <- c("NoH", "Mean_No_Feeds", "SE", "N", "CI")
+
+
+pdf("Figure5_Predicted_TotalFeeds_NoH_plot_20180516.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean4b_pred, aes(NoH, Mean_No_Feeds)) + 
+  xlab("Number of helpers") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean4b_pred, aes(NoH_Mean4b_pred$NoH, NoH_Mean4b_pred$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean4b_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean4b_pred,aes(label=NoH_Mean4b_pred$N, y=33.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())+ 
+        scale_y_continuous(limits=c(15,35))
+
+dev.off()
+
+#effect of 1 helper
+22.18597-17.00339
+#effect of extra helper, when have 1 helpers already
+28.01072-22.1859
+
+# Figure 6
+Aver6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), mean)
+SE6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), st.err)
+CI6 <- as.data.frame(SE6$x*1.96)
+NoBirds6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), length)
+NoH_Mean6 <- cbind(Aver6, SE6[,2], NoBirds6[,2], CI6[,1])
+colnames(NoH_Mean6) <- c("WatchType", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="FI"] <- "Brood. nestling"
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="FL"] <- "Fledgling"
+NoH_Mean6$WatchType <- factor(NoH_Mean6$WatchType, levels = c("Brood. nestling", "Nestling", "Fledgling"))
+
+  
+
+pdf("Figure6_Predicted_TotalFeeds_WatchType_plot_20180517.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean6, aes(WatchType, Mean_No_Feeds)) + 
+  xlab("Provisioning watch type") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean6, aes(NoH_Mean6$WatchType, NoH_Mean6$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean6, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean6,aes(label=NoH_Mean6$N, y=23.5,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+          scale_y_continuous(limits=c(17,24))
+dev.off()
+
+# visits of inc nestling v nestling
+21.62478-17.58130
+```
+
+
+** PLOT Fig.4 - posterior estimates of fixed effects for total feeds (sub dataset, NoOffspring==1) **
+---
+```{r, cache=T}
+####Figure 4
+load(file="model4_UnID_tot_sub_thin2000_180426.Rdata")
+Fig4 <- as.data.frame(posterior.mode(model4_UnID_tot_sub$Sol))
+Fig4b <- HPDinterval(model4_UnID_tot_sub$Sol)
+Fig4 <- cbind(Fig4, Fig4b)
+colnames(Fig4) <- c("PosteriorMode", "Lower", "Upper")
+rownames(Fig4) = c("Intercept","log(ObsDuration)", "Monthly insect abundance*","Territory quality*","Group size*" ,"No. helpers" ,"Provisioning and brooding","Provisioning fledgling*")
+Fig4$Parameter <- rownames(Fig4)
+Fig4 = Fig4[-2,]
+
+pdf("Figure4_sub_Total_feed_modelsum.pdf", width = 7, height = 5)
+ggplot(Fig4,aes(x=Parameter,y=PosteriorMode))+ 
+  geom_point()+
+  theme_bw() +
+  theme(panel.border = element_blank())+
+  theme(axis.line = element_line(color = 'black'))+
+  geom_errorbar(aes(ymin=Lower,
+                    ymax=Upper), width=0.2)+
+  theme(axis.text=element_text(size=11))+
+  xlab("")+
+  geom_hline(yintercept=0, size=0.15, linetype="dashed")+
+  ylab("Parameter estimates") +
+  coord_flip() + scale_x_discrete(limits=rev(Fig4$Parameter))
+
+dev.off()
+
+####Figure 5
+# Generate predicted values with MCMCglmm model
+Predictions4b <- predict(model4_UnID_tot_sub, interval="confidence")
+pred.4b <- as.data.frame(cbind(data_tot_sub,Predictions4b))
+
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+     }
+Aver4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), mean)
+SE4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), st.err)
+CI4b_pred <- as.data.frame(SE4b_pred$x*1.96)
+NoBirds4b_pred <- aggregate(pred.4b$fit, list(NoH=pred.4b$NoH), length)
+NoH_Mean4b_pred <- cbind(Aver4b_pred, SE4b_pred[,2], NoBirds4b_pred[,2], CI4b_pred[,1])
+colnames(NoH_Mean4b_pred) <- c("NoH", "Mean_No_Feeds", "SE", "N", "CI")
+
+pdf("Figure5_sub_Predicted_TotalFeeds_NoH_plot_20180517.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean4b_pred, aes(NoH, Mean_No_Feeds)) + 
+  xlab("Number of helpers") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) + 
+ geom_point(data=NoH_Mean4b_pred, aes(NoH_Mean4b_pred$NoH, NoH_Mean4b_pred$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean4b_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean4b_pred,aes(label=NoH_Mean4b_pred$N, y=33.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+          scale_y_continuous(limits=c(15,35))
+
+dev.off()
+
+#effect of 1 helper
+22.18597-17.00339
+#effect of extra helper, when have 1 helpers already
+28.01072-22.1859
+
+# Figure 6
+Aver6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), mean)
+SE6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), st.err)
+CI6 <- as.data.frame(SE6$x*1.96)
+NoBirds6 <- aggregate(pred.4b$fit, list(WatchType=pred.4b$WatchType), length)
+NoH_Mean6 <- cbind(Aver6, SE6[,2], NoBirds6[,2], CI6[,1])
+colnames(NoH_Mean6) <- c("WatchType", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="FI"] <- "Brood. nestling"
+levels(NoH_Mean6$WatchType)[levels(NoH_Mean6$WatchType)=="FL"] <- "Fledgling"
+NoH_Mean6$WatchType <- factor(NoH_Mean6$WatchType, levels = c("Brood. nestling", "Nestling", "Fledgling"))
+
+pdf("Figure6_sub_Predicted_TotalFeeds_WatchType_sub_20180517.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean6, aes(WatchType, Mean_No_Feeds)) + 
+  xlab("Provisioning watch type") + 
+  ylab("Predicted no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean6, aes(NoH_Mean6$WatchType, NoH_Mean6$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean6, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean6,aes(label=NoH_Mean6$N, y=23.5,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=15)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())+          scale_y_continuous(limits=c(16,24))
+
+dev.off()
+
+# visits of inc nestling v nestling
+21.62478-17.58130
+```
+
+
+
+
+**UNUSED SCRIPT**
+===
+
+
+**DID NOT USE THIS FIRST MODEL, as decided to use monthly insects and overall index of TQ instead**
+---
+
+MCMCglmm (can't use offset in MCMCglmm, see "OffsetTest.Rproj"; use a prior to set the log(ObsDuration) regression coefficient to 1 (as suggested by Jarrod: https://stat.ethz.ch/pipermail/r-sig-mixed-models/2011q3/016817.html; NB: you need to log ObsDuration)).
+In this model I use **AnnualInsects** (based on "usys_qTerrQualityInsectsPerDM2", where I take the total counts per location per FPID, and then take the mean of these [to account for the fact that there were 15 locations before 2000, and 14 after 1999]; “usys_qTerrQualityInsectsPerDM2” accounts for e.g. when ferns aren’t measured in all years so when missing ferns is estimated based on  Pisonia, Morinda & Ficus counts) and **TQ** (per season; based on sys_TerritoryQuality) where **missing values are estimated from closest previous/next season**:
+
+```{r, cache=T}
+library(MCMCglmm)
+prior1exp_sex = list(B = list(V=diag(13)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0,0,0,0)),
+                     #from subset model: B = list(V=diag(9)*1e7, mu=c(0,1,0,0,0,0,0,0,0)). Comment Hannah 4-12-15:  surprised the mod_subs_foffset model runs as the beta prior matrix is too large, but it must just ignore the extras. If you post this, I would correct it to right dimensions
+                     R = list(V = 1, n =0.002), 
+                     G = list(G1 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G3 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior1exp_sex$B$V[2,2] <- 1e-7  ## replace ObsDuration (offset) variance
+prior1exp_sex
+
+#mod1_UnID_exp_thin100 <- MCMCglmm(NoFeeds ~  log(ObsDuration) + AnnualInsects + TQc_Combined + NoOffspring + GroupSize + NoH*Status + Status*WatchType, random=~ idh(Status):BirdID + NestID:NestWatchID + Obs , family="poisson", data=data_UnID, prior=prior1exp_sex, burnin=500000, thin=100, nitt=1500000, verbose=TRUE)
+#save(mod1_UnID_exp_thin100, file="mod1_UnID_exp_thin100.Rdata")
+load("mod1_UnID_exp_thin100.Rdata")
+
+autocorr(mod1_UnID_exp_thin100$Sol) 
+autocorr(mod1_UnID_exp_thin100$VCV)
+heidel.diag(mod1_UnID_exp_thin100$VCV)
+geweke.diag(mod1_UnID_exp_thin100$VCV)
+geweke.plot(mod1_UnID_exp_thin100$VCV)
+
+summary(mod1_UnID_exp_thin100)
+posterior.mode(mod1_UnID_exp_thin100$Sol)
+HPDinterval(mod1_UnID_exp_thin100$Sol)
+posterior.mode(mod1_UnID_exp_thin100$VCV)
+HPDinterval(mod1_UnID_exp_thin100$VCV)
+plot(mod1_UnID_exp_thin100$VCV)
+```
+
+
+```{r}
+# New data set below is not used in manuscript
+# To plot the regression lines, attempted to use glmer as couldn't get new.data to work with MCMCglmm
+# need to scale to get it to converge (TQ already standardised)
+# Model is nearly unidentifiable: very large eigenvalue, so need to scale fixed effects 
+
+data_UnID_res$MonthlyInsects_2sd  <- scale(data_UnID_res$MonthlyInsects, scale = (sd(data_UnID_res$MonthlyInsects))*2)
+data_UnID_res$NoOffspring_2sd  <- scale(data_UnID_res$NoOffspring, scale = (sd(data_UnID_res$NoOffspring))*2)
+data_UnID_res$GroupSize_2sd  <- scale(data_UnID_res$GroupSize, scale = (sd(data_UnID_res$GroupSize))*2)
+# don't scale No_H as want this in graph
+# data_UnID_res$NoH_2sd  <- scale(data_UnID_res$NoH, scale = (sd(data_UnID_res$NoH))*2)
+
+mod_glm1a <- glmer(NoFeeds ~ offset(log(ObsDuration)) + MonthlyInsects_2sd + TQ + NoOffspring_2sd + GroupSize_2sd + NoH*Status + Status*WatchType + (1|BirdID) + (1|NestID:NestWatchID) + (1|Obs) , family="poisson", data=data_UnID_res)
+ss <- getME(mod_glm1a,c("theta","fixef"))
+mod_glm1b <- update(mod_glm1a,start=ss,control=glmerControl(optCtrl=list(maxfun=2e4)))
+
+new.dat2 <- unique(cbind(data_UnID_res$NoH, data_UnID_res$Status, data_UnID_res$WatchType))
+colnames(new.dat2) <- c("NoH", "Status", "WatchType")
+new.dat <- data.frame(NoH = new.dat2[,1],
+                      Status = new.dat2[,2],
+                       WatchType= new.dat2[,3],
+               ObsDuration=mean(data_UnID_res$ObsDuration, na.rm=TRUE),
+               MonthlyInsects_2sd=mean(data_UnID_res$MonthlyInsects_2sd, na.rm=TRUE),
+               TQ=mean(data_UnID_res$TQ, na.rm=TRUE),
+               NoOffspring_2sd=mean(data_UnID_res$NoOffspring_2sd, na.rm=TRUE),
+               GroupSize_2sd=mean(data_UnID_res$GroupSize_2sd, na.rm=TRUE))
+new.dat$NoH <- as.numeric(new.dat$NoH)
+new.dat$Status <- as.factor(new.dat$Status)
+levels(new.dat$Status)[levels(new.dat$Status)=="1"] <- "BrF"
+levels(new.dat$Status)[levels(new.dat$Status)=="2"] <- "BrM"
+new.dat$WatchType <- as.factor(new.dat$WatchType)
+levels(new.dat$WatchType)[levels(new.dat$WatchType)=="1"] <- "F"
+levels(new.dat$WatchType)[levels(new.dat$WatchType)=="2"] <- "FI"
+levels(new.dat$WatchType)[levels(new.dat$WatchType)=="3"] <- "FL"
+
+Predictions2=predict(mod_glm1b, newdata = new.dat, re.form=NA, type="response")
+pred.l2 <- as.data.frame(new.dat2[,1])
+colnames(pred.l2) <- c("NoH")
+pred.l2<-cbind(pred.l2, new.dat, Predictions2)
+```
+
+
+```{r}
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # 
+#  
+#  Plot: No. of helpers against No. of feeds - DIDN'T USE
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+Aver2b <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH), mean)
+SE2b <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH), st.err)
+CI2b <- as.data.frame(SE2b$x*1.96)
+NoBirds2b <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH), length)
+NoH_Mean2b <- cbind(Aver2b, SE2b[,2], NoBirds2b[,2], CI2b[,1])
+colnames(NoH_Mean2b) <- c("NoH", "Mean_No_Feeds", "SE", "N", "CI")
+
+g1 <- ggplot(data=NoH_Mean2b, aes(NoH, Mean_No_Feeds)) + 
+  xlab("Number of helpers") + 
+  ylab("Mean number of feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean2b, aes(NoH_Mean2b$NoH, NoH_Mean2b$Mean_No_Feeds)) + 
+  geom_errorbar(data=NoH_Mean2b, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+geom_text(data=NoH_Mean2b,aes(label=NoH_Mean2b$N, y=10.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+pdf("NoFeeds_NoH_CI_Regression_plot.pdf", width = 5, height = 5)
+g1 +  
+  geom_smooth(data=pred.l2, aes(x=NoH, y=Predictions2),formula = y ~ x, alpha=0.3, method = "glm") 
+dev.off()
+
+
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # # 
+#  
+#  Plot: WatchType against No. of feeds, per Sex - DIDN't USE
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #  
+
+Aver3 <- aggregate(data_UnID_res[,5], list(WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), mean)
+SE3 <- aggregate(data_UnID_res[,5], list(WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), st.err)
+CI3 <- as.data.frame(SE3$x*1.96)
+NoBirds3 <- aggregate(data_UnID_res[,5], list(WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), length)
+NoH_Mean3 <- cbind(Aver3, SE3[,3], NoBirds3[,3], CI3[,1])
+colnames(NoH_Mean3) <- c("WatchType", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean3$WatchType)[levels(NoH_Mean3$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean3$WatchType)[levels(NoH_Mean3$WatchType)=="FI"] <- "Inc. nestling"
+levels(NoH_Mean3$WatchType)[levels(NoH_Mean3$WatchType)=="FL"] <- "Fledgling"
+NoH_Mean3$WatchType <- factor(NoH_Mean3$WatchType, levels = c("Inc. nestling", "Nestling", "Fledgling"))
+
+pdf("NoFeeds_WatchType_Sex_CI_Regression_plot.pdf", width = 8, height = 5)
+ggplot(data=NoH_Mean3, aes(WatchType, Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  xlab("Provisioning watch type") + 
+  ylab("Mean number of feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean3, aes(NoH_Mean3$WatchType, NoH_Mean3$Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  geom_errorbar(data=NoH_Mean3, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status)  + #width=0.2
+geom_text(data=NoH_Mean3,aes(label=NoH_Mean3$N, y=18.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+dev.off()
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+#  
+#  Plot: No. of helpers against No. of feeds, per WatchType - DIDN'T USE
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+Aver <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType), mean)
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+     }
+SE <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType), st.err)
+CI <- as.data.frame(SE$x*1.96)
+NoBirds <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType), length)
+NoH_Mean <- cbind(Aver, SE[,3], NoBirds[,3], CI[,1])
+colnames(NoH_Mean) <- c("NoH", "WatchType", "Mean_No_Feeds", "SE", "N", "CI")
+
+library(ggplot2)
+g1 <- ggplot(data=NoH_Mean, aes(NoH, Mean_No_Feeds)) + 
+facet_grid(~WatchType) +
+  xlab("Number of helpers") + 
+  ylab("Mean number of feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean, aes(NoH_Mean$NoH, NoH_Mean$Mean_No_Feeds)) + 
+facet_grid(~WatchType) +
+  geom_errorbar(data=NoH_Mean, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~WatchType)  + #width=0.2
+geom_text(data=NoH_Mean,aes(label=NoH_Mean$N, y=15.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+pdf("NoFeeds_NoH_WatchType_CI_Regression_plot.pdf", width = 5, height = 5)
+g1 +  
+  geom_smooth(data=pred.l2, aes(x=NoH, y=Predictions2),formula = y ~ x, alpha=0.3, method = "glm") 
+dev.off()
+
+
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # 
+#  
+#  Plot: No. of helpers against No. of feeds, per Sex - DIDN'T USE
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+Aver2 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, Status=data_UnID_res$Status), mean)
+SE2 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, Status=data_UnID_res$Status), st.err)
+CI2 <- as.data.frame(SE2$x*1.96)
+NoBirds2 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, Status=data_UnID_res$Status), length)
+NoH_Mean2 <- cbind(Aver2, SE2[,3], NoBirds2[,3], CI2[,1])
+colnames(NoH_Mean2) <- c("NoH", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+
+g1 <- ggplot(data=NoH_Mean2, aes(NoH, Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  xlab("Number of helpers") + 
+  ylab("Mean number of feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean2, aes(NoH_Mean2$NoH, NoH_Mean2$Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  geom_errorbar(data=NoH_Mean2, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status)  + #width=0.2
+geom_text(data=NoH_Mean2,aes(label=NoH_Mean2$N, y=12.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+pdf("NoFeeds_NoH_Sex_CI_Regression_plot.pdf", width = 5, height = 5)
+g1 +  
+  geom_smooth(data=pred.l2, aes(x=NoH, y=Predictions2),formula = y ~ x, alpha=0.3, method = "glm") 
+dev.off()
+
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # 
+#  
+#  Plot: PREDICTED No. of helpers against No. of feeds, per Sex - DIDN'T USE
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+Aver2_pred <- aggregate(pred.2b[,57], list(NoH=pred.2b$NoH, Status=pred.2b$Status), mean)
+st.err <- function(x) {
+    sd(x)/sqrt(length(x))
+     }
+SE2_pred <- aggregate(pred.2b[,57], list(NoH=pred.2b$NoH, Status=pred.2b$Status), st.err)
+CI2_pred <- as.data.frame(SE2_pred$x*1.96)
+NoBirds2_pred <- aggregate(pred.2b[,57], list(NoH=pred.2b$NoH, Status=pred.2b$Status), length)
+NoH_Mean2_pred <- cbind(Aver2_pred, SE2_pred[,3], NoBirds2_pred[,3], CI2_pred[,1])
+colnames(NoH_Mean2_pred) <- c("NoH", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+
+pdf("Predicted NoFeeds_NoH_Sex_plot.pdf", width = 5, height = 5)
+ggplot(data=NoH_Mean2_pred, aes(NoH, Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  xlab("Number of helpers") + 
+  ylab("Predicted mean no. feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean2_pred, aes(NoH_Mean2_pred$NoH, NoH_Mean2_pred$Mean_No_Feeds)) + 
+facet_grid(~Status) +
+  geom_errorbar(data=NoH_Mean2_pred, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status)  + #width=0.2
+geom_text(data=NoH_Mean2_pred,aes(label=NoH_Mean2_pred$N, y=12.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+dev.off()
+
+
+# # # # # # # # # # # # # # # # # # # # # # #  # # # # # # # # # # # # 
+#  
+#  Plot: NoH against No. of feeds, per Sex & WatchType - NOT USED
+# 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #  
+
+Aver4 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), mean)
+SE4 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), st.err)
+CI4 <- as.data.frame(SE4$x*1.96)
+NoBirds4 <- aggregate(data_UnID_res[,5], list(NoH=data_UnID_res$NoH, WatchType=data_UnID_res$WatchType, Status=data_UnID_res$Status), length)
+NoH_Mean4 <- cbind(Aver4, SE4[,4], NoBirds4[,4], CI4[,1])
+colnames(NoH_Mean4) <- c("NoH", "WatchType", "Status", "Mean_No_Feeds", "SE", "N", "CI")
+levels(NoH_Mean4$WatchType)[levels(NoH_Mean4$WatchType)=="F"] <-  "Nestling"
+levels(NoH_Mean4$WatchType)[levels(NoH_Mean4$WatchType)=="FI"] <- "Inc. nestling"
+levels(NoH_Mean4$WatchType)[levels(NoH_Mean4$WatchType)=="FL"] <- "Fledgling"
+#NoH_Mean4$WatchType <- factor(NoH_Mean4$WatchType, levels = c("Inc. nestling", "Nestling", "Fledgling"))
+
+pdf("NoH_NoFeeds_WatchType_Sex_CI_Regression_plot.pdf", width = 8, height = 5)
+ggplot(data=NoH_Mean4, aes(NoH, Mean_No_Feeds)) + 
+facet_grid(~Status+WatchType) +
+  xlab("Number of helpers") + 
+  ylab("Mean number of feeds +/- 95% CI") +
+  expand_limits(y=0) +
+ geom_point(data=NoH_Mean4, aes(NoH_Mean4$NoH, NoH_Mean4$Mean_No_Feeds)) + 
+facet_grid(~Status+WatchType) +
+  geom_errorbar(data=NoH_Mean4, aes(ymin = (Mean_No_Feeds-CI), ymax =(Mean_No_Feeds+CI))) + 
+facet_grid(~Status+WatchType)  + #width=0.2
+geom_text(data=NoH_Mean4,aes(label=NoH_Mean4$N, y=20.0,srt=90)) +
+theme_bw() +
+  theme(text = element_text(size=20)) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+dev.off()
+
+```
+
+
+
+**DID NOT USE ANY OF THIS SECTION**
+---
+Plotting results 
+
+> This section is pending improvement on plotting.
+
+Following from github.com/bbolker
+MCMCglmm makes it a little bit easier to get confidence intervals on the predictions. The marginal argument specifies which random effects we want the predictions to "marginalise" (i.e., average over). The default is to use all of the random effects in the original model (i.e. ~subject in this case), i.e. to predict the average population-level outcome. The approach taken below to get the subject-level predictions (i.e. marginalise over nothing, since subject is the only random effect) is a bit of a hack: this may be easier in future versions.
+
+In order to get all the predictions we want, we need to refit the model using pr=TRUE to store the random effects (which are sometimes quite large, hence not stored by default):
+
+```{r}
+mpred0 <- predict(mod2_UnID_exp_thin100_sex ,interval="confidence")
+colnames(mpred0) <- paste("mpred0",c("fit","lwr","upr"),sep=".")
+mpred1 <- predict(mod2_UnID_exp_thin100_sex ,interval="confidence",marginal=~idh(Status):BirdID + NestID:NestWatchID + Obs) #the random part of the mixed model
+colnames(mpred1) <- paste("mpred1",c("fit","lwr","upr"),sep=".")
+dataf <- data.frame(data_UnID,mpred0,mpred1)
+```
+
+Plot confidence intervals
+```{r}
+g0 <- ggplot(dataf,aes(x=NoH,y=FeedsPerHour))+
+  stat_sum(aes(size=factor(..n..)),alpha=0.5)+
+  facet_grid(~Status+WatchType)+
+  scale_size_discrete(name="n",range=c(2,5))
+g0 + geom_line(aes(x=as.numeric(NoH),y=mpred0.fit),colour="red")+
+  geom_ribbon(aes(x=as.numeric(NoH),y=mpred0.fit,
+                  ymin=mpred0.lwr,ymax=mpred0.upr),fill="red",
+              alpha=0.3)
+```
+
+Plot confidence intervals
+```{r}
+g0 + geom_line(aes(x=as.numeric(NoH),y=mpred1.fit),colour="red")+
+  geom_ribbon(aes(x=as.numeric(NoH),y=mpred1.fit,
+                  ymin=mpred1.lwr,ymax=mpred1.upr),fill="red",
+              alpha=0.3)
+```
+
+```{r}
+ggplot(dataf, aes( x=WatchType, y=FeedsPerHour)) + 
+facet_grid(~Status)+
+  geom_boxplot() 
+  +
+  geom_point(size=3, shape=21, colour="blue", fill="white") +
+  facet_grid(~Status)
+  xlab("Type of provisioning watch") +
+  ylab("Predicted feeds per hr (± 95% CI)") +
+  expand_limits(y=c(7,10)) +
+  scale_y_continuous(breaks=0:20*0.5) +  
+  scale_x_discrete(breaks=c("FI", "F", "FL"),
+                   labels=c("Incubated chick", "Chick", "Fledgling")) +
+  theme_bw() +
+  theme(text = element_text(size=30), axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+  
+```
+We can plot individual predictions and confidence intervals as well, although in this case the plot is almost identical:
+
+```{r}
+g0 + geom_line(aes(x=as.numeric(mnth),y=mpred1.fit,group=subject),
+               colour="blue")+
+   geom_ribbon(aes(x=as.numeric(mnth),y=mpred1.fit,group=subject,
+                  ymin=mpred1.lwr,ymax=mpred1.upr),fill="blue",
+              alpha=0.05) #geom_smooth() to get rid of jaggedness
+```
+
+*Model with NoOffspring:NoH interaction (NOT USED)*
+---
+```{r,cache=TRUE}
+library(MCMCglmm)
+prior5_tot = list(B = list(V=diag(10)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0)), # No. parameters & intercept & extra level; default is B$mu=0 and B$V=I*1e+10
+                  R = list(V = 1, n =0.002), 
+                  G = list(G1 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior5_tot$B$V[2,2] <- 1e-7 
+prior5_tot
+
+model5_UnID_tot <- MCMCglmm(TotalFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + NoOffspring*NoH + GroupSize + WatchType , random=~NestID:NestWatchID + Obs, family="poisson", data=data_tot, prior=prior5_tot, verbose=TRUE, burnin=10000, thin=20, nitt=210000) 
+save(model5_UnID_tot, file="model5_UnID_tot_thin2000.Rdata")
+load("model5_UnID_tot_thin2000.Rdata")
+
+autocorr(model5_UnID_tot$Sol) # for each parameter against self, Lag 200 < 0.1
+autocorr(model5_UnID_tot$VCV) # for each parameter against self, Lag 200 > 0.16 for NestID:NestWatchID and units
+heidel.diag(model5_UnID_tot$VCV) # ok
+geweke.diag(model5_UnID_tot$VCV) # z-scores should be <2; ok
+geweke.plot(model5_UnID_tot$VCV) #
+plot(model5_UnID_tot$VCV) # still bimodal
+
+summary(model5_UnID_tot)
+posterior.mode(model5_UnID_tot$Sol)
+HPDinterval(model5_UnID_tot$Sol)
+posterior.mode(model5_UnID_tot$VCV)
+HPDinterval(model5_UnID_tot$VCV)
+```
+
+
+**Run in glmer, effects need standardising for it to run (NOT USED**
+---
+```{r}
+GroupSize_2sd  <- (sd(data_UnID$GroupSize))*2
+data_UnID$GroupSize_2sd  <- scale(data_UnID$GroupSize, scale = GroupSize_2sd)
+AnnualInsects_2sd <- (sd(data_UnID$AnnualInsects))*2
+data_UnID$AnnualInsects_2sd  <- scale(data_UnID$AnnualInsects, scale = AnnualInsects_2sd)
+TQc_Combined_2sd <- (sd(data_UnID$TQc_Combined))*2
+data_UnID$TQc_Combined_2sd  <- scale(data_UnID$TQc_Combined, scale = TQc_Combined_2sd)
+NoH_2sd <- (sd(data_UnID$NoH))*2
+data_UnID$NoH_2sd  <- scale(data_UnID$NoH, scale = NoH_2sd)
+mean(data_UnID$NoH_2sd )
+sd(data_UnID$NoH_2sd )
+mod1_glmer <- glmer(NoFeeds ~  offset(log(ObsDuration)) + Month + GroupSize_2sd  + AnnualInsects_2sd  + TQc_Combined_2sd  + NoOffspring + NoH_2sd*Status + Status*WatchType + (1|BirdID) + (1|NestID:NestWatchID) + (1|Obs), family=poisson, data=data_UnID, control=glmerControl(optimizer="bobyqa"))
+# you have to log the offset, and control chosen otherwise it doens't converge http://stackoverflow.com/questions/21344555/convergence-error-for-development-version-of-lme4 
+summary(mod1_glmer)
+save(mod1_glmer, file="mod1_glmer.Rdata")
+# relgrad <- with(mod1_glmer@optinfo$derivs,solve(Hessian,gradient))
+# max(abs(relgrad))
+```
+
+
+Check results when 'No. of helpers' is a category - the interaction with males is not significantly greater for feeds with 1 helper (p=0.075):
+---
+```{r, cache=T}
+data_UnID_res_category <- data_UnID_res
+data_UnID_res_category$NoH <- as.factor(data_UnID_res_category$NoH)
+mod_glm1c <- glmer(NoFeeds ~ offset(log(ObsDuration)) + MonthlyInsects_2sd + TQ + NoOffspring_2sd + GroupSize_2sd + NoH*Status + Status*WatchType + (1|BirdID) + (1|NestID:NestWatchID) + (1|Obs) , family="poisson", data=data_UnID_res_category)
+ss <- getME(mod_glm1c,c("theta","fixef"))
+mod_glm1d <- update(mod_glm1c,start=ss,control=glmerControl(optCtrl=list(maxfun=2e4)))
+
+summary(mod_glm1d)  # NoH*Male p = 0.0755
+```
+
+
+** DID NOT USE THIS MODEL **
+MCMCglmm. In this model we use Watchtype == FI and F only, as there are few observations with WatchType=="FL" #Not running initially, as wrong prior structure, as have to remove the FL and intearction levels from the prior
+```{r, cache=T}
+library(MCMCglmm)
+data_UnID_res2 <- subset(data_UnID_res,WatchType !="FL")
+data_UnID_res2 <- data_UnID_res[-which(data_UnID_res$WatchType=="FL"),]
+
+prior3exp_sex = list(B = list(V=diag(11)*1e7, mu=c(0,1,0,0,0,0,0,0,0,0,0)), #removed level FL, so less interactions
+                     R = list(V = 1, n =0.002), 
+                     G = list(G1 = list(V = diag(2)*0.02,nu=3,alpha.mu=rep(0,2),alpha.V=diag(2)*1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G3 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+prior3exp_sex$B$V[2,2] <- 1e-7  ## replace ObsDuration (offset) variance
+prior3exp_sex
+
+mod3_UnID_exp_thin200_noFL <- MCMCglmm(NoFeeds ~  log(ObsDuration) + MonthlyInsects + TQ + NoOffspring + GroupSize + NoH*Status + Status*WatchType, random=~ idh(Status):BirdID + NestID:NestWatchID + Obs , family="poisson", data=data_UnID_res2, prior=prior3exp_sex, burnin=500000, thin=200, nitt=2500000, verbose=TRUE)
+save(mod3_UnID_exp_thin200_noFL, file="mod3_UnID_exp_thin200_noFL.Rdata")
+
+
+#autocorr(mod2_UnID_exp_thin200$Sol) 
+#autocorr(mod2_UnID_exp_thin200$VCV)
+#heidel.diag(mod2_UnID_exp_thin200$VCV)
+#geweke.diag(mod2_UnID_exp_thin200$VCV)
+#geweke.plot(mod2_UnID_exp_thin200$VCV)
+
+#summary(mod2_UnID_exp_thin200)
+#posterior.mode(mod2_UnID_exp_thin200$Sol)
+#HPDinterval(mod2_UnID_exp_thin200$Sol)
+#posterior.mode(mod2_UnID_exp_thin200$VCV)
+#HPDinterval(mod2_UnID_exp_thin200$VCV)
+#plot(mod2_UnID_exp_thin200$VCV)
+```
+
+** DID NOT USE THIS MODEL as uses month, includes offset etc**
+---
+And model:
+
+```{r,cache=TRUE}
+library(MCMCglmm)
+prior_tot = list(R = list(V = 1, n =0.002), 
+                 G = list(G1 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000), G2 = list(V = 1,nu= 0.002,alpha.mu=0,alpha.V=1000)))
+
+modelLL_UnID_tot <- MCMCglmm(TotalFeeds ~  offset(ObsDuration) + Month + AnnualInsects + TQc_Combined + NoOffspring + NoH + WatchType , random=~NestID:NestWatchID + Obs, family="poisson", data=data_tot, prior=prior_tot, verbose=TRUE, burnin=50000, thin=1000, nitt=1500000) 
+save(modelLL_UnID_tot, file="modelLL_UnID_tot_thin1000_noFL.Rdata")
+
+heidel.diag(modelLL_UnID_tot$VCV)
+geweke.diag(modelLL_UnID_tot$VCV)
+geweke.plot(modelLL_UnID_tot$VCV)
+
+summary(modelLL_UnID_tot$Sol)
+summary(modelLL_UnID_tot$VCV)
+plot(modelLL_UnID_tot$Sol)
+plot(modelLL_UnID_tot$VCV)
+autocorr(modelLL_UnID_tot$Sol)
+autocorr(modelLL_UnID_tot$VCV)
+```
+
+**END SCRIPT**
+===
